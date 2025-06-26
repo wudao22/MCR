@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +21,9 @@ import (
 	"github.com/chzyer/readline"
 	_ "github.com/mattn/go-sqlite3"
 )
+
+// 数据目录常量
+const dataDir = "data"
 
 // RCON包类型常量
 const (
@@ -202,7 +206,7 @@ var minecraftCommands = []string{
 type ServerConfig struct {
 	ID       int
 	Name     string
-	Address  string // 保存用户输入的原始地址（域名/IP）
+	Address  string
 	Password string
 	LastUsed time.Time
 }
@@ -215,47 +219,60 @@ type ConfigDB struct {
 
 // 创建新的配置数据库管理器
 func NewConfigDB() (*ConfigDB, error) {
+	// 确保数据目录存在
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("无法创建数据目录: %v", err)
+	}
+
 	// 打开数据库
-	db, err := sql.Open("sqlite3", "rcon_config.db")
+	dbPath := filepath.Join(dataDir, "rcon_config.db")
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("无法打开数据库: %v", err)
 	}
 
-	// 生成或获取加密密钥
-	key := generateOrGetKey()
-
-	configDB := &ConfigDB{
-		db:  db,
-		key: key,
-	}
-
 	// 初始化数据库表
+	configDB := &ConfigDB{db: db}
 	err = configDB.initTables()
 	if err != nil {
 		db.Close()
 		return nil, err
 	}
 
+	// 获取或生成加密密钥
+	key, err := configDB.generateOrGetKey()
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("获取加密密钥失败: %v", err)
+	}
+
+	configDB.key = key
 	return configDB, nil
 }
 
 // 生成或获取加密密钥
-func generateOrGetKey() []byte {
-	keyFile := "rcon.key"
-
-	// 尝试读取现有密钥
-	if data, err := os.ReadFile(keyFile); err == nil && len(data) == 32 {
-		return data
+func (c *ConfigDB) generateOrGetKey() ([]byte, error) {
+	// 尝试从数据库读取密钥
+	var key []byte
+	err := c.db.QueryRow("SELECT key FROM encryption_key WHERE id = 1").Scan(&key)
+	if err == nil && len(key) == 32 {
+		return key, nil
 	}
 
 	// 生成新密钥
-	key := make([]byte, 32)
-	rand.Read(key)
+	key = make([]byte, 32)
+	_, err = rand.Read(key)
+	if err != nil {
+		return nil, fmt.Errorf("生成密钥失败: %v", err)
+	}
 
-	// 保存密钥到文件
-	os.WriteFile(keyFile, key, 0600)
+	// 保存密钥到数据库
+	_, err = c.db.Exec("INSERT OR REPLACE INTO encryption_key (id, key) VALUES (1, ?)", key)
+	if err != nil {
+		return nil, fmt.Errorf("保存密钥失败: %v", err)
+	}
 
-	return key
+	return key, nil
 }
 
 // 初始化数据库表
@@ -267,6 +284,11 @@ func (c *ConfigDB) initTables() error {
 		address TEXT NOT NULL,
 		password TEXT NOT NULL,
 		last_used DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+	
+	CREATE TABLE IF NOT EXISTS encryption_key (
+		id INTEGER PRIMARY KEY,
+		key BLOB NOT NULL
 	);
 	
 	CREATE INDEX IF NOT EXISTS idx_last_used ON server_configs(last_used DESC);
@@ -371,18 +393,15 @@ func (c *ConfigDB) GetAllConfigs() ([]ServerConfig, error) {
 		err := rows.Scan(&config.ID, &config.Name, &config.Address,
 			&encryptedPassword, &lastUsedStr)
 		if err != nil {
-			continue // 跳过损坏的记录
+			continue
 		}
 
-		// 解密密码
 		config.Password, err = c.decryptPassword(encryptedPassword)
 		if err != nil {
-			continue // 跳过无法解密的记录
+			continue
 		}
 
-		// 解析时间
 		config.LastUsed, _ = time.Parse("2006-01-02 15:04:05", lastUsedStr)
-
 		configs = append(configs, config)
 	}
 
@@ -410,15 +429,12 @@ func (c *ConfigDB) GetConfigByName(name string) (*ServerConfig, error) {
 		return nil, err
 	}
 
-	// 解密密码
 	config.Password, err = c.decryptPassword(encryptedPassword)
 	if err != nil {
 		return nil, fmt.Errorf("密码解密失败: %v", err)
 	}
 
-	// 解析时间
 	config.LastUsed, _ = time.Parse("2006-01-02 15:04:05", lastUsedStr)
-
 	return &config, nil
 }
 
@@ -487,7 +503,7 @@ func selectServerConfig(configDB *ConfigDB) (*ServerConfig, error) {
 	}
 
 	if len(configs) == 0 {
-		return nil, nil // 没有保存的配置
+		return nil, nil
 	}
 
 	fmt.Println("选择连接方式:")
@@ -500,27 +516,23 @@ func selectServerConfig(configDB *ConfigDB) (*ServerConfig, error) {
 	choice = strings.TrimSpace(choice)
 
 	if choice != "1" {
-		return nil, nil // 选择输入新地址
+		return nil, nil
 	}
 
-	// 显示配置列表
 	showSavedConfigs(configDB)
 
 	fmt.Print("请输入配置序号或名称: ")
 	input, _ := reader.ReadString('\n')
 	input = strings.TrimSpace(input)
 
-	// 尝试解析为数字
 	if num, err := strconv.Atoi(input); err == nil {
 		if num >= 1 && num <= len(configs) {
 			selected := configs[num-1]
 			return &selected, nil
-		} else {
-			return nil, fmt.Errorf("序号 %d 超出范围", num)
 		}
+		return nil, fmt.Errorf("序号 %d 超出范围", num)
 	}
 
-	// 按名称查找
 	config, err := configDB.GetConfigByName(input)
 	if err != nil {
 		return nil, err
@@ -563,7 +575,7 @@ func askToSaveConfig(configDB *ConfigDB, address, password string) {
 	}
 }
 
-// 解析地址，支持主机名解析，如果没有端口则使用默认端口25575
+// 解析地址
 func parseAddress(input string) (string, error) {
 	var host, port string
 
@@ -576,16 +588,14 @@ func parseAddress(input string) (string, error) {
 		port = parts[1]
 	} else {
 		host = input
-		port = "25575" // 默认端口
+		port = "25575"
 	}
 
-	// 尝试解析主机名
 	ips, err := net.LookupIP(host)
 	if err != nil {
 		return "", fmt.Errorf("无法解析主机名 '%s': %v", host, err)
 	}
 
-	// 优先使用IPv4地址
 	var resolvedIP string
 	for _, ip := range ips {
 		if ip.To4() != nil {
@@ -594,7 +604,6 @@ func parseAddress(input string) (string, error) {
 		}
 	}
 
-	// 如果没有IPv4地址，使用第一个IPv6地址
 	if resolvedIP == "" && len(ips) > 0 {
 		resolvedIP = ips[0].String()
 	}
@@ -611,7 +620,6 @@ func main() {
 	fmt.Println("高性能 Go 实现，支持命令自动补全、主机名解析和配置保存")
 	fmt.Println()
 
-	// 初始化配置数据库
 	configDB, err := NewConfigDB()
 	if err != nil {
 		fmt.Printf("初始化配置数据库失败: %v\n", err)
@@ -622,7 +630,6 @@ func main() {
 	var addressInput, password string
 	var selectedConfig *ServerConfig
 
-	// 尝试选择已保存的配置
 	selectedConfig, err = selectServerConfig(configDB)
 	if err != nil {
 		fmt.Printf("选择配置失败: %v\n", err)
@@ -630,15 +637,11 @@ func main() {
 	}
 
 	if selectedConfig != nil {
-		// 使用保存的配置
 		addressInput = selectedConfig.Address
 		password = selectedConfig.Password
 		fmt.Printf("使用保存的配置: %s (%s)\n", selectedConfig.Name, selectedConfig.Address)
-
-		// 更新最后使用时间
 		configDB.UpdateLastUsed(selectedConfig.Name)
 	} else {
-		// 手动输入新配置
 		reader := bufio.NewReader(os.Stdin)
 		fmt.Print("请输入服务器地址 (支持IP/主机名，默认端口25575): ")
 		addressInput, _ = reader.ReadString('\n')
@@ -659,7 +662,6 @@ func main() {
 		}
 	}
 
-	// 解析地址，支持主机名解析
 	address, err := parseAddress(addressInput)
 	if err != nil {
 		fmt.Printf("地址解析错误: %v\n", err)
@@ -667,10 +669,8 @@ func main() {
 	}
 	fmt.Printf("连接地址: %s\n", address)
 
-	// 创建RCON客户端
 	client := NewRCONClient(address, password)
 
-	// 连接到服务器
 	fmt.Print("正在连接服务器...")
 	err = client.Connect()
 	if err != nil {
@@ -680,7 +680,6 @@ func main() {
 	defer client.Close()
 	fmt.Println(" 连接成功!")
 
-	// 进行身份验证
 	fmt.Print("正在进行身份验证...")
 	err = client.Authenticate()
 	if err != nil {
@@ -689,12 +688,10 @@ func main() {
 	}
 	fmt.Println(" 验证成功!")
 
-	// 如果是新配置，询问是否保存
 	if selectedConfig == nil {
 		askToSaveConfig(configDB, addressInput, password)
 	}
 
-	// 配置readline用于命令补全和输入
 	config := &readline.Config{
 		Prompt:            "RCON> ",
 		HistoryFile:       ".rcon_history",
@@ -717,7 +714,6 @@ func main() {
 	fmt.Println("输入 'config' 查看配置管理命令")
 	fmt.Println("----------------------------------------")
 
-	// 命令循环
 	for {
 		line, err := rl.Readline()
 		if err != nil {
@@ -725,10 +721,9 @@ func main() {
 				if len(line) == 0 {
 					fmt.Println("\n使用 'quit' 或 'exit' 退出程序")
 					continue
-				} else {
-					fmt.Println("\n命令被中断")
-					continue
 				}
+				fmt.Println("\n命令被中断")
+				continue
 			} else if err == io.EOF {
 				fmt.Println("\n正在退出...")
 				break
@@ -742,7 +737,6 @@ func main() {
 			continue
 		}
 
-		// 检查特殊命令
 		switch command {
 		case "quit", "exit":
 			fmt.Println("正在断开连接...")
@@ -759,7 +753,6 @@ func main() {
 			continue
 		}
 
-		// 处理config delete命令
 		if strings.HasPrefix(command, "config delete ") {
 			configName := strings.TrimSpace(strings.TrimPrefix(command, "config delete "))
 			if configName == "" {
@@ -776,14 +769,12 @@ func main() {
 			continue
 		}
 
-		// 执行Minecraft命令
 		response, err := client.ExecuteCommand(command)
 		if err != nil {
 			fmt.Printf("命令执行失败: %v\n", err)
 			continue
 		}
 
-		// 显示响应
 		if response != "" {
 			fmt.Printf("服务器响应: %s\n", response)
 		} else {
